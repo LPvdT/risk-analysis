@@ -1,0 +1,488 @@
+---
+title: 'Credit Risk Analysis: Predictive Analysis'
+author: "LvdT"
+output:
+  pdf_document:
+    number_sections: yes
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Credit Rating
+
+This project will assess data about the credit risk of certain customers of a German bank. In this dataset, the customers are classified as being a credit risk or not based on previously collected data.
+
+Credit risk can be defined as defaulting on a debt, due to the borrower being unable to make the stipulated debt payments in the agreed upon time frame. It is useful for a bank to conduct risk analysis, in order to ascertain whether or not a specific customer is likely to defaul on his debt.
+
+Predictive analysis encompasses the entire domain of creating predictive models and deriving insights from data. It employs a wide array of tools, such as classification algorithms, regression algorithms, neural networks and even deep learning. Predictive analysis is not all statistics and econometrics. Common business logic and domain knowledge is also involved in deciding upon the appropriate model.
+
+# The Data
+
+First, the data is loaded in and required dependencies are imported. Subsequently, the data frame is attached directly to the R environment in order to access its objects without constant referral to the superclass.
+
+```{r LoadData, message=FALSE, warning=FALSE}
+# Dependencies
+library(dplyr)
+library(caret)
+library(randomForest)
+library(ROCR)
+library(e1071)
+library(kernlab)
+library(rpart)
+library(rpart.plot)
+
+# Load in data transformed by descriptive process
+credit.df <- read.csv("credit_dataset_transformed.csv", header = TRUE, sep = ",")
+attach(credit.df)
+```
+
+# Functions
+
+Below, several functions are written. The first is to transform categorical variable to factors, so R is able to work with them properly. There is also a function to normalise numerical variables. As shown earlier on in the descriptive analysis, the numeric variables in the dataset all had skewed probability distributions. This results in induced collinearity, gradient distortion, increased convergence times for models, etc. Z-score normalisation can account for this:
+
+\[
+  \text{Znormalised}(e_i) = \frac{e_i - \bar{E}}{\sigma(E)}
+\]
+
+There are also functions for feature selection using recursive feature elimination and functions for plotting both the ROC (Receiver Operator Characteristic) and PR (Precision/Recall) curves for model evaluations.
+
+```{r Functions}
+## Function: factoring
+to.factors <- function(df, variables) {
+  
+  for (variable in variables) {
+    df[[variable]] <- as.factor(df[[variable]])
+  }
+  
+  return(df)
+}
+
+## Function: normalize
+scale.features <- function(df, variables) {
+  
+  for (variable in variables) {
+    df[[variable]] <- scale(df[[variable]], center = TRUE, scale = TRUE)
+  }
+  
+  return(df)
+}
+
+## Function: feature selection, using recursive feature elimination (and RF algorithm for model evaluation)
+run.feature.selection <- function(num.iters = 20, feature.vars, class.var) {
+
+  set.seed(10)
+  variable.sizes <- 1:10
+  control <- rfeControl(functions = rfFuncs, method = "cv", verbose = FALSE, returnResamp = "all", number = num.iters)
+  results.rfe <- rfe(x = feature.vars, y = class.var, sizes = variable.sizes, rfeControl = control)
+  
+  return(results.rfe)
+}
+
+## Function: visualise ROC curve
+plot.roc.curve <- function(predictions, title.text){
+  
+  perf <- performance(predictions, "tpr", "fpr")
+  plot(perf, col = "black", lty = 1, lwd = 2, main = title.text, cex.main = 1, cex.lab = 1, xaxs = "i", yaxs = "i")
+  abline(0,1, col = "red")
+  
+  auc <- performance(predictions, "auc")
+  auc <- unlist(slot(auc, "y.values"))
+  auc <- round(auc, 2)
+  
+  legend(0.4, 0.4, legend = c(paste0("AUC: ", auc)), cex = 1, bty = "n", box.col = "white")
+}
+
+## Function: visualize Precision Recall curve
+plot.pr.curve <- function(predictions, title.text){
+  
+  perf <- performance(predictions, "prec", "rec")
+  plot(perf, col = "black", lty = 1, lwd = 2, main = title.text, cex.main = 1, cex.lab = 1, xaxs = "i", yaxs = "i")
+}
+```
+
+
+# Preparation
+
+Like previously, in the descriptive analysis, the appropriate variables are categorised, scaled and renamed in order to make them usable. Afterwards, the dataset is split into _test_ and _train_ components. I have used 60:40 ratio, i.e. 600 tuples will be available to train algorithms on and 400 tuples will be available in the testing dataset.
+
+```{r Preparation}
+# Feature normalisation
+numeric.vars <- c("credit.duration.months", "age", "credit.amount")
+
+credit.df <- scale.features(credit.df, numeric.vars)
+
+# Feature factorisation
+categorical.vars <- c("credit.rating", "account.balance", "previous.credit.payment.status", "credit.purpose", "savings", "employment.duration", "installment.rate", "marital.status", "guarantor", "residence.duration", "current.assets", "other.credits", "apartment.type", "bank.credits", "occupation", "dependents", "telephone", "foreign.worker")
+
+credit.df <- to.factors(credit.df, categorical.vars)
+
+# Divide data: Train and Test in tuples by ratio 60:40
+indices <- sample(1:nrow(credit.df), size = 0.6 * nrow(credit.df))
+train.data <- credit.df[indices, ]
+test.data <- credit.df[-indices, ]
+```
+
+# Feature Selection
+
+Feature selection is an important principle in machine learning, which is used in order to remove redundant features, prevent overfitting, reduce model variance, reduce convergence time and training time and to build easy to interpret models. In this project, a recursive feature elimination algorithm has been used based on the Random Forest machine learning algorithm. Across each iteration of the feature selection, several machine learning models with different features are constructed repeatedly. Furthermore, each iteration the irrelevant features are eliminated in a process to maximise accuracy and minimise error. The principle of this algorithm is somewhat subject to chaos and entropy; global optima are generally not possible and depend on the starting point and initial conditions.  
+
+```{r FeatureSelection}
+# Run feature selections and print results
+rfe.results <- run.feature.selection(feature.vars = train.data[, -1], class.var = train.data[, 1])
+
+print(rfe.results)
+varImp(rfe.results)
+```
+
+The output of the feature selection shows the most important features. The top five being _account.balance_, _credit.duration.months_, _credit.amount_, _savings_ and _previous.credit.payment.status_.
+
+# Logistic
+
+The logistic algorithm uses a type of regression modeling where the dependent variable is dichotomous (i.e. binary). It can be expressed as a special case of the family of generalised linear models. The model estimates the relationship between the dependent variable and the features by maximum likelihood estimation, using the sigmoid function.
+
+First, the initial model is trained (_lr.model_) using all features in the dataset and the results summarised. Degrees of statistical significance are denoted by asterisks. Subsequently, predictions are made on the test data and stored in _lr.predictions_. The confusion matrix shows the accuracy, sensitivity and specificity of the model. A decent starting point, which also predicts bad credit ratings (which is important from a business point of view) quite well. The latter is a good feature, because the dataset predominantly features good credit rating customers, as shown during the descriptive phase of the project.
+
+For a second logistic modeling attempt, feature selection is used for the logistic algorithm. The importance plot shows the results. The new model, _lr.model.new_, uses the features _account.balance_, _credit.purpose_, _previous.credit.payment.status_, _savings_ and _credit.duration.months_ as suggested by the feature selection. The confusion matrix of _lr.predictions.new_ is shown also. Adding more feature-selected features may augment the model.
+
+```{r Logistic, warning=FALSE}
+### Predictive: Logistic
+test.feature.vars <- test.data[, -1]
+test.class.var <- test.data[, 1]
+
+formula.init <- as.formula("credit.rating ~ .") 
+
+lr.model <- glm(formula = formula.init, data = train.data, family = "binomial")
+summary(lr.model)
+
+lr.predictions <- predict(lr.model, test.data, type = "response") %>%
+  round()
+
+confusionMatrix(data = lr.predictions, reference = test.class.var, positive = "1")
+
+# Logistic: feature selection
+formula <- as.formula("credit.rating ~ .")
+
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 2)
+model <- train(formula, data = train.data, method = "glm", trControl = control)
+
+importance <- varImp(model, scale = FALSE)
+plot(importance)
+
+# Refine
+formula.new <- as.formula("credit.rating ~ account.balance + credit.purpose + previous.credit.payment.status + savings + credit.duration.months")
+
+lr.model.new <- glm(formula = formula.new, data = train.data, family = "binomial")
+
+lr.predictions.new <- predict(lr.model.new, test.data, type = "response") %>%
+  round()
+
+confusionMatrix(data = lr.predictions.new, reference = test.class.var, positive = "1")
+
+# Choose best fit: first model
+lr.model.best <- lr.model
+
+lr.prediction.values <- predict(lr.model.best, test.feature.vars, type = "response")
+predictions <- prediction(lr.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "Logistic Regression ROC Curve")
+plot.pr.curve(predictions, title.text = "Logistic Regression Precision/Recall Curve")
+```
+
+The first logistic model, using the full feature set, is the best model (_lr.model.best_). This model is evaluated using the ROC and PR curves. Let's see how a different algorithm performs.
+
+# Support Vector Machine
+
+The Support Vector Machine (SVM) is a machine learning algorithm of the supervised kind, which can be employed to conduct classification and regression tasks. The SVM algorithm will align the data in such a way that it becomes part of different, seperable (by Euclidean distance) classes. The samples on the edges of the classes are referred to as the support vectors, while the seperator of the classes is called the seperating hyperplane. The optimum seperating hyperplane can be seen as the border post between countries, whereas the disance between this border post and the support vectors is a 'no travel zone'. There is no data there. So far, this seperation has been assumed as linear. Sometimes this is not possible with the data at hand. In that case, a different kernel function can be used (e.g. polynomial, or radial basis) to make the seperation happen in a higher dimensional transformed feature space. However, due to the curse of dimensionality, model generalisation error increases and predictive power decreases when working in a higher dimensional feature space.
+
+The first SVM model (_svm.model_) has been built using the full feature set and a radial basis function (RBF) kernel function. Subsequently, the model's summary is generated, predictions are made and confusion matrix is shown. This model is ultra-aggressive and simply predicts every customer's rating as good. This is kind of useless.
+
+A feature selection procedure for SVM has been run for the second model and the most important variables can be seen in the importance plot. The new model (_svm.model.new_) has been built using the features _account.balance_, _credit.duration.months_, _savings_, _previous.credit.payment.status_ and _credit.amount_. The confusion matrix of this model is presented below.
+
+The next step involves using a grid search algorithm to optimise the model's gamma and cost paramaters in a process called hyperparameter tuning. The results of this process can be viewed in the gradient plot, where the darkest areas correspond with the best performance. The optimised model, using these outcomes, is called _svm.model.best_. Evaluation of the power of this model is shown in a confusion matrix. 
+
+```{r SVM}
+### Predictive: SVM
+# Train
+svm.model <- svm(formula = formula.init, data = train.data, kernel = "radial", cost = 100, gamma = 1)
+summary(svm.model)
+
+# Predict
+svm.predictions <- predict(svm.model, test.feature.vars)
+confusionMatrix(data = svm.predictions, reference = test.class.var, positive = "1")
+
+# Feature selection SVM
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 2)
+model <- train(formula.init, data = train.data, method = "svmRadial", trControl = control)
+
+importance <- varImp(model, scale = FALSE)
+plot(importance, cex.lab = 0.5)
+
+# New SVM model based on feature selection
+formula.new <- as.formula("credit.rating ~ account.balance + credit.duration.months + savings + previous.credit.payment.status + credit.amount")
+svm.model.new <- svm(formula = formula.new, data = train.data, kernel = "radial", cost = 100, gamma = 1)
+
+# Predict using new model: Accuracy down, specificity up, i.e. better model because poor credibility gets properly recognised.
+svm.predictions.new <- predict(svm.model.new, test.feature.vars)
+confusionMatrix(data = svm.predictions.new, reference = test.class.var, positive = "1")
+
+# Model hyperparameter optimisation using a grid search algorithm
+cost.weights <- c(0.1, 10, 100)
+gamma.weights <- c(0.01, 0.25, 0.5, 1)
+
+tuning.results <- tune(svm, formula.new, data = train.data, kernel = "radial", ranges = list(cost = cost.weights, gamma = gamma.weights))
+
+print(tuning.results)
+plot(tuning.results)
+
+# Predict using best model: Better accuracy, specificity and sensitivity
+svm.model.best <- tuning.results$best.model
+
+svm.predictions.best <- predict(svm.model.best, test.feature.vars)
+confusionMatrix(data = svm.predictions.best, reference = test.class.var, positive = "1")
+
+# Plots
+svm.predictions.best <- predict(svm.model.best, test.feature.vars, decision.values = T)
+svm.prediction.values <- attributes(svm.predictions.best)$decision.values
+predictions <- prediction(svm.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "SVM Optimised: ROC Curve")
+plot.pr.curve(predictions, title.text = "SVM Optimised: Prediction/Recall Curve")
+```
+
+Finally, ROC and PR curves have been generated for the optimised model. 
+
+## AUROC Optimalisation
+
+What if we want to optimise a model around its AUROC? Let's have a look. First, some recoding has to be done. R can go tits up if it has to deal with numeric variable column names. Therefore, the column names of 0 will be recoded to X0, 1 to X1, and so forth.
+
+Next, a new grid search algorithm (involving _C_ and _sigma_) is constructed to enable optimisation of the AUROC. The ensuing model is called _svm.roc.model_. Its confusion matrix is shown below.
+
+```{r OptAUROC}
+## Optimise based on AUROC
+# Tranform data for handling
+transformed.train <- train.data
+transformed.test <- test.data
+
+for (variable in categorical.vars) {
+  
+  new.train.var <- make.names(train.data[[variable]])
+  transformed.train[[variable]] <- new.train.var
+  
+  new.test.var <- make.names(test.data[[variable]])
+  transformed.test[[variable]] <- new.test.var
+}
+
+transformed.train <- to.factors(df = transformed.train, variables = categorical.vars)
+transformed.test <- to.factors(df = transformed.test, variables = categorical.vars)
+
+transformed.test.feature.vars <- transformed.test[, -1]
+transformed.test.class.var <- transformed.test[, 1]
+
+# AUROC optimised model
+grid <- expand.grid(C = c(1, 10, 100), sigma = c(0.01, 0.05, 0.1, 0.5, 1))
+
+ctr <- trainControl(method = "cv", number = 10, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+svm.roc.model <- train(formula.init, data = transformed.train, method = "svmRadial", trControl = ctr, tuneGrid = grid, metric = "ROC")
+
+# Predictions: Again good accuracy, slightly decreased specificity but increase in sensitivity
+predictions <- predict(svm.roc.model, transformed.test.feature.vars)
+confusionMatrix(predictions, transformed.test.class.var, positive = "X1")
+
+# Plots
+svm.predictions <- predict(svm.roc.model, transformed.test.feature.vars, type = "prob")
+svm.prediction.values <- svm.predictions[, 2]
+
+predictions <- prediction(svm.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "SVM AUROC Optimised: ROC Curve")
+plot.pr.curve(predictions, title.text = "SVM AUROC Optimised: Precision/Recall Curve")
+```
+
+The ROC and PR curves of this AUROC optimised model have been generated for evaluation. The next section of the project will explore the decision trees algorithm.
+
+# Decision Trees
+
+Another well-known type of the supervised algorithms family is the Decisions Trees algorithm. This type of algorithm can be used for both classification and regression (i.e. CART) and is often employed in the fields of business intelligence and operation research. Essentially, decision trees are flowcharts with several nodes and contitional triggers, which represent tests. Paths from the root to all the leaf notes denote the paths to a final outcome. The big downside of decision trees is that they are prone to overfitting issues. Furthermore, they generalise poorly.
+
+The first model, _dt.model_, is based on the entire feature set of the data. The results are displayed in the confusion matrix below. The next step is to implement feature selection for the Decision Trees algorithm. The results of this process are shown in the Importance plot. The _dt.model.new_ is a model based on the results of the feature selection process. It incorporates the _account.balance_, _savings_, _credit.amount_, _credit.duration.months_ and _previous.credit.payment.status_ variables. Besides the restricted variable set, a _prior_ parameter has also been parsed to the algorithm. This parameters allows for weightings to be applied to the different levels in the class variable. To account for the fact that the dataset features 700 people with good credit rating and only 300 people with bad credit rating, `prior = c(0.7, 0.3)` is used. Predictions are made using this model and the corresponding decision tree is shown below. 
+
+```{r DecTrees}
+### Predictive: Decision Trees
+# Initial model
+dr.control <- rpart.control(minsplit = 20, cp = 0.05)
+dt.model <- rpart(formula = formula.init, method = "class", data = train.data, control = dr.control)
+
+dt.predictions <- predict(dt.model, test.feature.vars, type = "class")
+confusionMatrix(data = dt.predictions, reference = test.class.var, positive = "1")
+
+# Feature selection
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 2)
+model <- train(formula.init, data = train.data, method = "rpart", trControl = control)
+
+importance <- varImp(model, scale = FALSE)
+plot(importance)
+
+# Feature selected model: Aggressive but classifies poor credit rating customers more efficiently
+# Prior parameter used to weight: 0.7 to bad credit, 0.3 to good credit (adjust for density skewness)
+formula.new <- as.formula("credit.rating ~ account.balance + savings + credit.amount + credit.duration.months + previous.credit.payment.status")
+
+dt.model.new <- rpart(formula = formula.new, method = "class", data = train.data, control = dr.control, parms = list(prior = c(0.7, 0.3)))
+
+dt.predictions.new <- predict(dt.model.new, test.feature.vars, type = "class")
+confusionMatrix(data = dt.predictions.new, reference = test.class.var, positive = "1")
+
+# Visualise best model
+dt.model.best <- dt.model.new
+print(dt.model.best)
+
+par(mfrow = c(1, 1))
+
+prp(dt.model.best, type = 1, extra = 3, varlen = 0, faclen = 0)
+
+dt.predictions.best <- predict(dt.model.best, test.feature.vars, type = "prob")
+dt.prediction.values <- dt.predictions.best[, 2]
+
+predictions <- prediction(dt.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "Decision Tree: ROC Curve")
+plot.pr.curve(predictions, title.text = "Decision Tree: Precision/Recall Curve")
+```
+
+The best model fit is parsed to the variable _dt.model.best_. ROC and PR plots are generated for this model for final evaluation.
+
+# Random Forests
+
+The Random Forest is an ensemble machine learning algorithm that is basically a collection of a lot of decision trees. It can be used for _CART_ tasks. The biggest advantage of the Random Forest algorithm with respect to the Decision Trees algorithm is that it accounts for the overfitting issue of Decision Trees by incorporating a degree of randomness into the model, thus decreasing variance. This occurs by choosing the best split at each leaf node iteratively using a bootstrap approach. As a result, the Randon Forest models generalise much better relative to Decision Trees.
+
+The initial model, _rf.model_, is built using the full feature set. The summary of the model, and the confusion matrix based on its predictions, are visualised below. The next model, _rf.model.new_, uses the top five features of the Random Forest feature selection process. These features are _account.balance_, _savings_, _credit.amount_, _credit.duration.months_ and _previous.credit.payment.status_. Predictions for this new model are, again, generated along with a follow-up confusion matrix.
+
+To improve upon the latter model, hyperparameter tuning is used by applying a grid search on the `ntree`, `nodesize` and `mtry` parameters. Respectively, these parameters denote the number of (decision) trees, the minimum size of terminal nodes and the number of variables randomly sampled at each split. The best configuration given by the hyperparameter tuning process is shown below and is used for the final Random Forest model: _rf.model.best_. This model is used to generate predictions and, subsequently, a confusion matrix. Results are shown below. 
+
+```{r RandForest}
+### Predictive: Random Forest
+rf.model <- randomForest(formula.init, data = train.data, importance = T, proximity = T)
+print(rf.model)
+
+rf.predictions <- predict(rf.model, test.feature.vars, type = "class")
+confusionMatrix(data = rf.predictions, reference = test.class.var, positive = "1")
+
+# Model with best features: Lower accuracy due to decrease in overfitting, better specificity, slightly lower sensitivity.
+formula.new <- as.formula("credit.rating ~ account.balance + savings + credit.amount + credit.duration.months + previous.credit.payment.status")
+
+rf.model.new <- randomForest(formula.new, data = train.data, importance = T, proximity = T)
+
+rf.predictions.new <- predict(rf.model.new, test.feature.vars, type = "class")
+
+confusionMatrix(data = rf.predictions.new, reference = test.class.var, positive = "1")
+
+# Hyperparameter tuning using grid search
+nodesize.vals <- c(2, 3, 4, 5)
+ntree.vals <- c(200, 500, 1000, 2000)
+
+tuning.results <- tune.randomForest(formula.new, data = train.data, mtry = 3, nodesize = nodesize.vals, ntree = ntree.vals)
+
+print(tuning.results)
+
+# Evaluate resulting best model: Very slight performance increase
+rf.model.best <- tuning.results$best.model
+rf.predictions.best <- predict(rf.model.best, test.feature.vars, type = "class")
+
+confusionMatrix(data = rf.predictions.best, reference = test.class.var, positive = "1")
+
+# Evaluation plots
+rf.predictions.best <- predict(rf.model.best, test.feature.vars, type = "prob")
+rf.prediction.values <- rf.predictions.best[, 2]
+
+predictions <- prediction(rf.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "Random Forest: ROC Curve")
+plot.pr.curve(predictions, title.text = "Random Forest: Precision/Recall Curve")
+```
+
+To further evaluate the last and best Random Forest model, the ROC and PR curves are visualised for it.
+
+# Neural Networks
+
+Artificial neural networks are part of the family of machine learning models that aim to mirror the concept and inner workings of biological neural networks (e.g. like in the human nervous system). The concept of the Neural Network algorithm has been around for quite a while, although recently it has become all the rage to design complex systems using deep learning and artifical intelligence. Deep learning is a process that makes use of deep neural networks (i.e. Neural Network algorithms with a large amount of hidden layers).
+
+A neural network can be imagined as a web of interconnected nodes, the neurons. Simply put, each neuron in a neural network is defined by a mathematical function (e.g. the sigmoid function or a step function), which receives a weighted input from the edges of other neurons. Once received, the neuron performs a computation and delivers an output. The output is passed on to the next node and this process continues on until the output layer has been reached. Each set of nodes is called a layer and is a subset of the neural network; the input layer, the hidden layer and the output layer. Each learning period, i.e. epoch, the weights at each node is updated, the neuron's function produces the output and the output is parsed along the interconnected neurons until it reaches the output prediction in the output layer.
+
+## Fitting
+
+The first block of code below contains all fitting operations of the neural networks. This has been seperated from the prediction output in the second block of code in order to hide the iterations of convergence. Keeping this in the output would increase the document's size by more than a hundred pages.
+
+```{r NN_convergence_operations, results='hide', message=FALSE, warning=FALSE}
+nn.model <- train(formula.init, data = transformed.train, method = "nnet")
+
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 2)
+model <- train(formula.init, data = transformed.train, method = "nnet", trControl = control)
+
+formula.new <- as.formula("credit.rating ~ foreign.worker + previous.credit.payment.status + account.balance + employment.duration + guarantor + credit.purpose + savings")
+
+nn.model.new <- train(formula.new, data = transformed.train, method = "nnet")
+```
+
+## Prediction & Evaluation
+
+The first Neural Network to train will be a model using the entire feature set again. It is assigned to the _nn.model_ variable. This can be seen in the code above. The results of the model, after it has converged, are shown below. Moreover, predictions are made using the model and its corresponding confusion matrix is shown below.
+
+Next, feature selection for the Neural Network is executed using repeated crossvalidation. The resulting new features are _foreign.worker_, _previous.credit.payment.status_, _account.balance_, _employment.duration_, _guarantor_, _credit.purpose_ and _savings_. These have also been visualised in the Importance plot below. Using these features, the iterations of convergence for the model called _nn.model.new_ have been started as shown above. Hyperparameter tuning for the configuration of this Neural Network algorithm has taken place internally. The process, and its results, have been visualised below in the Hidden Units plot. New predictions and a new confusion matrix have been generated based on this new model. The results are shown below.
+
+```{r NeuralNet}
+### Predictive: Neural Networks
+# Uses earlier encoded data tranformations (i.e. 1 -> X01)
+print(nn.model)
+
+# Decent accuracy with decent accuracy and specificity
+nn.predictions <- predict(nn.model, transformed.test.feature.vars, type = "raw")
+confusionMatrix(data = nn.predictions, reference = transformed.test.class.var, positive = "X1")
+
+# Important feature selection
+importance <- varImp(model, scale = FALSE)
+plot(importance)
+
+# New model based on important features
+nn.predictions.new <- predict(nn.model.new, transformed.test.feature.vars, type = "raw")
+confusionMatrix(data = nn.predictions.new, reference = transformed.test.class.var, positive = "X1")
+
+# Visualisation of internal hyperparameter tuning
+plot(nn.model.new, cex.lab = 0.5)
+
+# Best model: Second model
+nn.model.best <- nn.model.new
+
+nn.predictions.best <- predict(nn.model.best, transformed.test.feature.vars, type = "prob")
+nn.prediction.values <- nn.predictions.best[, 2]
+predictions <- prediction(nn.prediction.values, test.class.var)
+
+par(mfrow = c(1, 2))
+
+plot.roc.curve(predictions, title.text = "Neural Network: ROC Curve")
+plot.pr.curve(predictions, title.text = "Neural Network: Precision/Recall Curve")
+```
+
+The best Neural Nework model, which is the last one based on feature selection and hyperparameter tuning, has been stored in the variable _nn.model.best_. The ROC and PR charts, along with the AUC value, are shown above for this model.
+
+# Concluding Remarks
+
+This has been a simple project to briefly demonstrate the use of several machine learning algorithms to predict the credit rating of bank customers. It serves as a basic demonstration of a machine learning workflow.
+
+## Model Selection
+
+In this particular project, several machine learning algorithms are used to determine the credit rating of customers based on specific feature sets derived from the data set. In order to maximise profits and minimise losses, we need a model that does not incorrectly predict a bad customer's credit rating as good. This will most likely result in the customer defaulting on the payments, which will lead to a complete loss scenario. The model also should not predict credit worthy customers as having a bad credit rating. This effectively denies income, but does not generate a loss.
